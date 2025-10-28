@@ -5,6 +5,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { Heart, Send, MessageCircle } from "lucide-react";
 import { supabase } from "@/lib/supabaseClient";
+import { useToast } from "@/hooks/use-toast";
+import { z } from "zod";
 
 type GreetingMessage = {
   id: string;
@@ -13,13 +15,27 @@ type GreetingMessage = {
   submittedAt: string;
 };
 
+const greetingSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(2, { message: "Nama minimal 2 karakter" })
+    .max(100, { message: "Nama maksimal 100 karakter" }),
+  message: z
+    .string()
+    .trim()
+    .min(10, { message: "Ucapan minimal 10 karakter" })
+    .max(500, { message: "Ucapan maksimal 500 karakter" }),
+});
+
 const KirimUcapanSection = () => {
   const [name, setName] = useState("");
   const [message, setMessage] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [messagesList, setMessagesList] = useState<GreetingMessage[]>([]);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [validationErrors, setValidationErrors] = useState<{ name?: string; message?: string }>({});
+  const { toast } = useToast();
 
   const formatDateTime = (isoString: string) =>
     new Intl.DateTimeFormat("id-ID", {
@@ -29,14 +45,8 @@ const KirimUcapanSection = () => {
 
   useEffect(() => {
     const fetchMessages = async () => {
-      if (!supabase) {
-        setErrorMessage(
-          "Backend belum dikonfigurasi."
-        );
-        return;
-      }
       setIsLoadingMessages(true);
-      setErrorMessage(null);
+      
       const { data, error } = await supabase
         .from("greetings")
         .select("id, name, message, submitted_at")
@@ -44,7 +54,11 @@ const KirimUcapanSection = () => {
 
       if (error) {
         console.error("Error fetching greetings:", error.message);
-        setErrorMessage("Gagal memuat ucapan. Silakan coba beberapa saat lagi.");
+        toast({
+          title: "Gagal memuat ucapan",
+          description: "Silakan refresh halaman ini.",
+          variant: "destructive",
+        });
         setMessagesList([]);
       } else if (data) {
         const normalized = data.map((item) => ({
@@ -59,53 +73,90 @@ const KirimUcapanSection = () => {
     };
 
     void fetchMessages();
-  }, []);
+
+    // Setup realtime subscription
+    const channel = supabase
+      .channel("greetings-changes")
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "greetings",
+        },
+        (payload) => {
+          const newGreeting = payload.new as {
+            id: string;
+            name: string;
+            message: string;
+            submitted_at: string;
+          };
+          
+          const normalized: GreetingMessage = {
+            id: String(newGreeting.id),
+            name: newGreeting.name,
+            message: newGreeting.message,
+            submittedAt: newGreeting.submitted_at,
+          };
+          
+          setMessagesList((prev) => [normalized, ...prev]);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [toast]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setValidationErrors({});
 
-    if (!name.trim() || !message.trim()) {
-      console.warn("Nama atau pesan belum diisi.");
+    // Validate input
+    const validation = greetingSchema.safeParse({
+      name: name.trim(),
+      message: message.trim(),
+    });
+
+    if (!validation.success) {
+      const errors: { name?: string; message?: string } = {};
+      validation.error.errors.forEach((err) => {
+        if (err.path[0] === "name") errors.name = err.message;
+        if (err.path[0] === "message") errors.message = err.message;
+      });
+      setValidationErrors(errors);
+      toast({
+        title: "Validasi Gagal",
+        description: "Silakan periksa kembali form Anda.",
+        variant: "destructive",
+      });
       return;
     }
 
     setIsSubmitting(true);
 
-    if (!supabase) {
-      console.error("Backend belum dikonfigurasi.");
-      setErrorMessage(
-        "Backend belum dikonfigurasi."
-      );
-      setName("");
-      setMessage("");
-      setIsSubmitting(false);
-      return;
-    }
-
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from("greetings")
       .insert({
-        name: name.trim(),
-        message: message.trim(),
-      })
-      .select("id, name, message, submitted_at")
-      .single();
+        name: validation.data.name,
+        message: validation.data.message,
+      });
 
     if (error) {
       console.error("Error saving greeting:", error.message);
-      setErrorMessage("Gagal mengirim ucapan. Silakan coba beberapa saat lagi.");
-    } else if (data) {
-      const newMessage: GreetingMessage = {
-        id: String(data.id),
-        name: data.name,
-        message: data.message,
-        submittedAt: data.submitted_at,
-      };
-
-      setMessagesList((prev) => [newMessage, ...prev]);
+      toast({
+        title: "Gagal mengirim ucapan",
+        description: "Silakan coba lagi dalam beberapa saat.",
+        variant: "destructive",
+      });
+    } else {
       setName("");
       setMessage("");
-      setErrorMessage(null);
+      toast({
+        title: "Ucapan terkirim!",
+        description: "Terima kasih atas doa dan ucapannya.",
+      });
     }
 
     setIsSubmitting(false);
@@ -153,9 +204,19 @@ const KirimUcapanSection = () => {
                 type="text"
                 placeholder="Masukkan nama Anda"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="bg-background/50 border-accent/30 focus:border-accent transition-all duration-300"
+                onChange={(e) => {
+                  setName(e.target.value);
+                  if (validationErrors.name) {
+                    setValidationErrors((prev) => ({ ...prev, name: undefined }));
+                  }
+                }}
+                className={`bg-background/50 border-accent/30 focus:border-accent transition-all duration-300 ${
+                  validationErrors.name ? "border-red-500" : ""
+                }`}
               />
+              {validationErrors.name && (
+                <p className="text-sm text-red-500 mt-1">{validationErrors.name}</p>
+              )}
             </div>
 
             <div
@@ -170,10 +231,20 @@ const KirimUcapanSection = () => {
                 id="message"
                 placeholder="Tuliskan ucapan dan doa Anda di sini..."
                 value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                onChange={(e) => {
+                  setMessage(e.target.value);
+                  if (validationErrors.message) {
+                    setValidationErrors((prev) => ({ ...prev, message: undefined }));
+                  }
+                }}
                 rows={5}
-                className="bg-background/50 border-accent/30 focus:border-accent transition-all duration-300 resize-none"
+                className={`bg-background/50 border-accent/30 focus:border-accent transition-all duration-300 resize-none ${
+                  validationErrors.message ? "border-red-500" : ""
+                }`}
               />
+              {validationErrors.message && (
+                <p className="text-sm text-red-500 mt-1">{validationErrors.message}</p>
+              )}
             </div>
 
             <div
@@ -226,12 +297,15 @@ const KirimUcapanSection = () => {
             </div>
 
             <div className="space-y-6 max-h-[420px] overflow-y-auto pr-2">
-              {isLoadingMessages && <p className="text-sm text-muted-foreground">Memuat ucapan...</p>}
-              {errorMessage && !isLoadingMessages && (
-                <p className="text-sm text-red-600">{errorMessage}</p>
+              {isLoadingMessages && (
+                <div className="flex items-center justify-center py-8">
+                  <div className="w-8 h-8 border-4 border-accent/30 border-t-accent rounded-full animate-spin" />
+                </div>
               )}
-              {!isLoadingMessages && !errorMessage && messagesList.length === 0 && (
-                <p className="text-sm text-muted-foreground">Belum ada ucapan yang masuk.</p>
+              {!isLoadingMessages && messagesList.length === 0 && (
+                <p className="text-sm text-muted-foreground text-center py-8">
+                  Belum ada ucapan yang masuk. Jadilah yang pertama!
+                </p>
               )}
               {messagesList.map((item, index) => (
                 <div
