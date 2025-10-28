@@ -4,7 +4,9 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { Heart, Send, MessageCircle } from "lucide-react";
-import { supabase } from "@/lib/supabaseClient";
+import { supabase } from "@/integrations/supabase/client";
+import { useToast } from "@/components/ui/use-toast";
+import { z } from "zod";
 
 type GreetingMessage = {
   id: string;
@@ -19,7 +21,13 @@ const KirimUcapanSection = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [messagesList, setMessagesList] = useState<GreetingMessage[]>([]);
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [validationErrors, setValidationErrors] = useState<{ name?: string; message?: string }>({});
+  const { toast } = useToast();
+
+  const greetingSchema = z.object({
+    name: z.string().trim().min(2, "Nama minimal 2 karakter").max(100, "Nama maksimal 100 karakter"),
+    message: z.string().trim().min(10, "Ucapan minimal 10 karakter").max(500, "Ucapan maksimal 500 karakter")
+  });
 
   const formatDateTime = (isoString: string) =>
     new Intl.DateTimeFormat("id-ID", {
@@ -29,86 +37,130 @@ const KirimUcapanSection = () => {
 
   useEffect(() => {
     const fetchMessages = async () => {
-      if (!supabase) {
-        setErrorMessage(
-          "Supabase belum dikonfigurasi. Tambahkan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY untuk menampilkan ucapan."
-        );
-        return;
-      }
       setIsLoadingMessages(true);
-      setErrorMessage(null);
-      const { data, error } = await supabase
-        .from("greetings")
-        .select("id, name, message, submitted_at")
-        .order("submitted_at", { ascending: false });
+      try {
+        const { data, error } = await supabase
+          .from("greetings")
+          .select("id, name, message, submitted_at")
+          .order("submitted_at", { ascending: false });
 
-      if (error) {
-        console.error("Error fetching greetings:", error.message);
-        setErrorMessage("Gagal memuat ucapan. Silakan coba beberapa saat lagi.");
-        setMessagesList([]);
-      } else if (data) {
-        const normalized = data.map((item) => ({
-          id: String(item.id),
-          name: item.name,
-          message: item.message,
-          submittedAt: item.submitted_at,
-        }));
-        setMessagesList(normalized);
+        if (error) {
+          console.error("Error fetching greetings:", error.message);
+          toast({
+            title: "Gagal memuat ucapan",
+            description: "Silakan refresh halaman untuk mencoba lagi.",
+            variant: "destructive",
+          });
+          setMessagesList([]);
+        } else if (data) {
+          const normalized = data.map((item) => ({
+            id: String(item.id),
+            name: item.name,
+            message: item.message,
+            submittedAt: item.submitted_at,
+          }));
+          setMessagesList(normalized);
+        }
+      } catch (error) {
+        console.error("Error:", error);
+        toast({
+          title: "Terjadi kesalahan",
+          description: "Gagal memuat ucapan.",
+          variant: "destructive",
+        });
+      } finally {
+        setIsLoadingMessages(false);
       }
-      setIsLoadingMessages(false);
     };
 
     void fetchMessages();
-  }, []);
+
+    // Setup realtime subscription
+    const channel = supabase
+      .channel("greetings-changes")
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "greetings",
+        },
+        (payload) => {
+          const newMessage: GreetingMessage = {
+            id: String(payload.new.id),
+            name: payload.new.name,
+            message: payload.new.message,
+            submittedAt: payload.new.submitted_at,
+          };
+          setMessagesList((prev) => [newMessage, ...prev]);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [toast]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     
-    if (!name.trim() || !message.trim()) {
-      console.warn("Nama atau pesan belum diisi.");
+    // Clear previous validation errors
+    setValidationErrors({});
+
+    // Validate input
+    const validation = greetingSchema.safeParse({
+      name: name.trim(),
+      message: message.trim(),
+    });
+
+    if (!validation.success) {
+      const errors: { name?: string; message?: string } = {};
+      validation.error.errors.forEach((err) => {
+        if (err.path[0] === "name") errors.name = err.message;
+        if (err.path[0] === "message") errors.message = err.message;
+      });
+      setValidationErrors(errors);
       return;
     }
 
     setIsSubmitting(true);
 
-    if (!supabase) {
-      console.error("Supabase belum dikonfigurasi. Ucapan tidak dapat dikirim.");
-      setErrorMessage(
-        "Supabase belum dikonfigurasi. Tambahkan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY untuk mengirim ucapan."
-      );
-      setName("");
-      setMessage("");
+    try {
+      const { data, error } = await supabase
+        .from("greetings")
+        .insert({
+          name: name.trim(),
+          message: message.trim(),
+        })
+        .select("id, name, message, submitted_at")
+        .single();
+
+      if (error) {
+        console.error("Error saving greeting:", error.message);
+        toast({
+          title: "Gagal mengirim ucapan",
+          description: "Silakan coba beberapa saat lagi.",
+          variant: "destructive",
+        });
+      } else if (data) {
+        setName("");
+        setMessage("");
+        toast({
+          title: "Ucapan terkirim!",
+          description: "Terima kasih atas ucapan dan doa Anda.",
+        });
+      }
+    } catch (error) {
+      console.error("Error:", error);
+      toast({
+        title: "Terjadi kesalahan",
+        description: "Gagal mengirim ucapan.",
+        variant: "destructive",
+      });
+    } finally {
       setIsSubmitting(false);
-      return;
     }
-
-    const { data, error } = await supabase
-      .from("greetings")
-      .insert({
-        name: name.trim(),
-        message: message.trim(),
-      })
-      .select("id, name, message, submitted_at")
-      .single();
-
-    if (error) {
-      console.error("Error saving greeting:", error.message);
-      setErrorMessage("Gagal mengirim ucapan. Silakan coba beberapa saat lagi.");
-    } else if (data) {
-      const newMessage: GreetingMessage = {
-        id: String(data.id),
-        name: data.name,
-        message: data.message,
-        submittedAt: data.submitted_at,
-      };
-
-      setMessagesList((prev) => [newMessage, ...prev]);
-      setName("");
-      setMessage("");
-      setErrorMessage(null);
-    }
-
-    setIsSubmitting(false);
   };
 
   return (
@@ -154,9 +206,19 @@ const KirimUcapanSection = () => {
                 type="text"
                 placeholder="Masukkan nama Anda"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="bg-background/50 border-accent/30 focus:border-accent transition-all duration-300"
+                onChange={(e) => {
+                  setName(e.target.value);
+                  if (validationErrors.name) {
+                    setValidationErrors((prev) => ({ ...prev, name: undefined }));
+                  }
+                }}
+                className={`bg-background/50 border-accent/30 focus:border-accent transition-all duration-300 ${
+                  validationErrors.name ? "border-red-500" : ""
+                }`}
               />
+              {validationErrors.name && (
+                <p className="text-sm text-red-500 mt-1">{validationErrors.name}</p>
+              )}
             </div>
 
             <div
@@ -171,10 +233,20 @@ const KirimUcapanSection = () => {
                 id="message"
                 placeholder="Tuliskan ucapan dan doa Anda di sini..."
                 value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                onChange={(e) => {
+                  setMessage(e.target.value);
+                  if (validationErrors.message) {
+                    setValidationErrors((prev) => ({ ...prev, message: undefined }));
+                  }
+                }}
                 rows={5}
-                className="bg-background/50 border-accent/30 focus:border-accent transition-all duration-300 resize-none"
+                className={`bg-background/50 border-accent/30 focus:border-accent transition-all duration-300 resize-none ${
+                  validationErrors.message ? "border-red-500" : ""
+                }`}
               />
+              {validationErrors.message && (
+                <p className="text-sm text-red-500 mt-1">{validationErrors.message}</p>
+              )}
             </div>
 
             <div
@@ -227,12 +299,13 @@ const KirimUcapanSection = () => {
             </div>
 
             <div className="space-y-6 max-h-[420px] overflow-y-auto pr-2">
-              {isLoadingMessages && <p className="text-sm text-muted-foreground">Memuat ucapan...</p>}
-              {errorMessage && !isLoadingMessages && (
-                <p className="text-sm text-red-600">{errorMessage}</p>
+              {isLoadingMessages && (
+                <div className="flex items-center justify-center py-8">
+                  <div className="w-8 h-8 border-4 border-accent/30 border-t-accent rounded-full animate-spin" />
+                </div>
               )}
-              {!isLoadingMessages && !errorMessage && messagesList.length === 0 && (
-                <p className="text-sm text-muted-foreground">Belum ada ucapan yang masuk.</p>
+              {!isLoadingMessages && messagesList.length === 0 && (
+                <p className="text-sm text-muted-foreground text-center py-8">Belum ada ucapan yang masuk. Jadilah yang pertama!</p>
               )}
               {messagesList.map((item, index) => (
                 <div
